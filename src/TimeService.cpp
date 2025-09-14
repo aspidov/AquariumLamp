@@ -9,14 +9,18 @@ bool begin(const char* tz, unsigned long timeoutMs)
   // Configure timezone env and call tzset
   setenv("TZ", tz, 1);
   tzset();
+  // Configure SNTP servers and start time sync. Use a public pool with fallback.
+  // configTime will initialize the lwIP SNTP subsystem on ESP32.
+  configTime(0, 0, "pool.ntp.org", "time.google.com", "1.pool.ntp.org");
 
-  // Start SNTP (Arduino core for ESP32 wires this up when time.h funcs used)
-  // We'll try to wait until time is non-zero
+  // Wait until we have a reasonable epoch. Use a higher threshold to ensure
+  // the date is not 1970 (use 1e9 ~ 2001-09-09). This avoids false positives.
   unsigned long start = millis();
   time_t t = 0;
+  const time_t GOOD_THRESHOLD = 1000000000; // ~2001-09-09
   while ((millis() - start) < timeoutMs) {
     t = time(nullptr);
-    if (t > 1000000) { // arbitrary threshold (past 1970)
+    if (t > GOOD_THRESHOLD) {
       return true;
     }
     delay(200);

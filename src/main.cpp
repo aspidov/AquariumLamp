@@ -9,6 +9,7 @@
 #include "LEDController.h"
 #include "ApiServer.h"
 #include "TimeService.h"
+#include "Scheduler.h"
 
 // ------------------- PINOUT & COUNTS -------------------
 #define DIM_STRIP_PIN 4   // regular dimmable LED strip (MOSFET -> low-side)
@@ -64,7 +65,8 @@ void setup()
   // Initialize time from NTP only if WiFi connected. Best-effort; will not block OTA.
   bool timeOk = false;
   if (wifiOk) {
-    timeOk = TimeService::begin("UTC", 10000);
+    // Europe/Warsaw (CET/CEST) POSIX TZ: CET is UTC+1, CEST is UTC+2 during DST
+    timeOk = TimeService::begin("CET-1CEST,M3.5.0/2,M10.5.0/3", 10000);
   }
   Serial.printf("Time synced: %d, now=%s\n", timeOk ? 1 : 0, TimeService::nowIso().c_str());
 
@@ -75,6 +77,9 @@ void setup()
   ApiServer::init(server);
   ApiServer::registerRoutes(dimState, ws1State, ws2State, strip1, strip2);
   server.begin();
+
+  // Initialize scheduler (uses TimeService for triggers)
+  Scheduler::init(dimState, ws1State, ws2State, strip1, strip2);
 
   Serial.printf("HTTP server started (hostname=%s)\n", HOSTNAME);
 }
@@ -92,11 +97,14 @@ void loop()
   if (!s_timeSyncedHere) {
     String ip = WifiMgr::ipString();
     if (ip != "0.0.0.0" && ip.length() > 0) {
-      bool ok = TimeService::begin("UTC", 10000);
+  bool ok = TimeService::begin("CET-1CEST,M3.5.0/2,M10.5.0/3", 10000);
       Serial.printf("Deferred time sync: %d, now=%s\n", ok ? 1 : 0, TimeService::nowIso().c_str());
       s_timeSyncedHere = true; // only attempt once here
     }
   }
+
+  // Scheduler loop (quick non-blocking)
+  Scheduler::loop();
 
   // You can add lightweight periodic tasks here (no delay(…); use vTaskDelay if needed)
   // vTaskDelay(1); // optional yield

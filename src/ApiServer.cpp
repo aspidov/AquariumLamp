@@ -2,6 +2,7 @@
 #include <ESPAsyncWebServer.h>
 #include "LEDController.h"
 #include "TimeService.h"
+#include "Scheduler.h"
 
 namespace ApiServer {
 
@@ -85,6 +86,8 @@ static String htmlIndex()
     <h2>Status</h2>
   <div id="status">Loading...</div>
   <div class="small">Time: <span id="time">--</span></div>
+  <div class="small">Schedule:</div>
+  <div id="schedule" class="small">(loading)</div>
   </div>
 
 <script>
@@ -134,6 +137,26 @@ function updateStatus() {
       statusHtml += `<strong>WS1 Strip:</strong> ${state.ws1.on ? 'On' : 'Off'}, Brightness: ${state.ws1.brightness}, Color: ${rgbToHex(state.ws1.r, state.ws1.g, state.ws1.b)}<br>`;
       statusHtml += `<strong>WS2 Strip:</strong> ${state.ws2.on ? 'On' : 'Off'}, Brightness: ${state.ws2.brightness}, Color: ${rgbToHex(state.ws2.r, state.ws2.g, state.ws2.b)}<br>`;
       document.getElementById('status').innerHTML = statusHtml;
+      // Render schedule
+      const schedEl = document.getElementById('schedule');
+      if (state.schedule && Array.isArray(state.schedule)) {
+        if (state.schedule.length === 0) {
+          schedEl.textContent = '(no entries)';
+        } else {
+          let out = '';
+          state.schedule.forEach(e => {
+            const dir = e.isUtc ? 'UTC' : 'local';
+            out += `${String(e.hour).padStart(2,'0')}:${String(e.minute).padStart(2,'0')} (${dir}) ${e.anim} for ${Math.round(e.durationMs/60000)}m`;
+            if (e.followUp) {
+              out += ` → follow:${e.followUp}`;
+            }
+            out += '<br>';
+          });
+          schedEl.innerHTML = out;
+        }
+      } else {
+        schedEl.textContent = '(none)';
+      }
     });
 }
 
@@ -258,6 +281,9 @@ void registerRoutes(StripState& dimState, StripState& ws1State, StripState& ws2S
   // include current time if available
   String t = TimeService::nowIso();
   json += "\"time\":\"" + t + "\",";
+  // include schedule info
+  String sched = Scheduler::getScheduleJson();
+  json += "\"schedule\":" + sched + ",";
     json += "\"animation\":\"" + animName + "\",";
     // Read actual PWM duty and strip hardware brightnesss where possible
     uint8_t hwPwm = LEDController::getPwmDuty(0);
