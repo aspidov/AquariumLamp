@@ -1,145 +1,349 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <ArduinoOTA.h>
 #include <Adafruit_NeoPixel.h>
-#include <math.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
 
-// ------------------- CONFIG -------------------
-#define DIM_STRIP_PIN 4   // regular dimmable LED strip
-#define WS1_PIN 17        // first WS2812 strip
-#define WS2_PIN 18        // second WS2812 strip
+#include "secrets.h"
+
+// ------------------- PINOUT & COUNTS -------------------
+#define DIM_STRIP_PIN 4   // regular dimmable LED strip (MOSFET -> low-side)
+#define WS1_PIN 17        // first WS2812 strip data
+#define WS2_PIN 18        // second WS2812 strip data
 
 #define WS1_COUNT 15
 #define WS2_COUNT 15
 
-// ------------------- OBJECTS -------------------
+// ------------------- LED OBJECTS -------------------
 Adafruit_NeoPixel strip1(WS1_COUNT, WS1_PIN, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel strip2(WS2_COUNT, WS2_PIN, NEO_GRB + NEO_KHZ800);
 
-// ------------------- STATE VARIABLES -------------------
-// Master breathing envelope (used for both addressable strips and the dimmable strip)
-unsigned long lastBreathUpdate = 0;
-const int breathInterval = 20; // ms per envelope update
-const int breathPeriod = 3000; // ms for a full breath in/out cycle
+// ------------------- HOST / NETWORK -------------------
+static const char* HOSTNAME = "aquarium-lamp";  // visible as aquarium-lamp.local
 
-// Hue animation for addressable strips
-unsigned long lastHueUpdate = 0;
-const int hueInterval = 30; // ms per hue step
-int hueOffset = 0;
+// ------------------- PWM (LEDC) CONFIG -------------------
+static const int DIM_CH     = 0;     // LEDC channel for PWM
+static const int DIM_FREQ   = 5000;  // 5 kHz is fine for LED dimming
+static const int DIM_RES    = 8;     // 8-bit (0..255 duty)
 
-// PWM (dimmable) base brightness (0-255) before breathing is applied
-const int pwmBase = 255; // max base, breathing scales this
+// ------------------- SERVER -------------------
+AsyncWebServer server(80);
 
-// Blink behavior for addressable strips
-unsigned long lastBlinkEvent = 0;
-unsigned long blinkStart = 0;
-bool blinkActive = false;
-int nextBlinkInterval = 5000; // ms until next blink (randomized)
-const int blinkIntervalBase = 5000; // base interval ms
-const int blinkJitter = 2000; // +/- jitter
-const int blinkDuration = 200; // ms blink length
+// ------------------- STATE -------------------
+struct StripState {
+  uint8_t brightness;     // 0..255 (for both types)
+  uint8_t r, g, b;        // solid color for addressable strips
+  bool on;
+};
+
+StripState dimState   {255, 255, 255, 255, true}; // brightness used as PWM duty; rgb unused
+StripState ws1State   {128, 255, 255, 255, true};
+StripState ws2State   {128, 255, 255, 255, true};
+
+// Dirty flags to trigger non-blocking updates from loop()
+volatile bool ws1Dirty = false;
+volatile bool ws2Dirty = false;
 
 // ------------------- HELPERS -------------------
-uint32_t Wheel(byte WheelPos) {
-  if (WheelPos < 85) {
-    return Adafruit_NeoPixel::Color(WheelPos * 3, 255 - WheelPos * 3, 0);
-  } else if (WheelPos < 170) {
-    WheelPos -= 85;
-    return Adafruit_NeoPixel::Color(255 - WheelPos * 3, 0, WheelPos * 3);
-  } else {
-    WheelPos -= 170;
-    return Adafruit_NeoPixel::Color(0, WheelPos * 3, 255 - WheelPos * 3);
+void applyDimPwm()
+{
+  uint8_t duty = dimState.on ? dimState.brightness : 0;
+  ledcWrite(DIM_CH, duty);
+}
+
+void applyStripSolid(Adafruit_NeoPixel& strip, const StripState& st)
+{
+  // NeoPixel setBrightness scales colors internally (0..255)
+  strip.setBrightness(st.on ? st.brightness : 0);
+  uint32_t c = strip.Color(st.r, st.g, st.b);
+  strip.fill(c, 0, strip.numPixels());
+  strip.show(); // Blocking but very short; we’re not animating
+}
+
+void markDirty()
+{
+  ws1Dirty = true;
+  ws2Dirty = true;
+}
+
+void markDirty(volatile bool &flag)
+{
+  flag = true;
+}
+
+String htmlIndex()
+{
+  // minimal UI with buttons and sliders
+  return R"HTML(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Aquarium Lamp</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.2rem; }
+    .card { border: 1px solid #ccc; border-radius: 12px; padding: 1rem; margin-bottom: 1rem; }
+    .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+    button { padding: 0.5rem 0.8rem; border-radius: 8px; border: 1px solid #aaa; cursor: pointer; }
+    input[type=range] { width: 200px; }
+    .small { font-size: 0.9rem; color: #444; }
+  </style>
+</head>
+<body>
+  <h1>Aquarium Lamp</h1>
+
+  <div class="card">
+    <h2>Regular Strip (PWM @ GPIO 4)</h2>
+    <div class="row">
+      <button onclick="fetch('/api/dim/on')">On</button>
+      <button onclick="fetch('/api/dim/off')">Off</button>
+      <label>Brightness <input id="dimB" type="range" min="0" max="255" value="255" oninput="setDim()"></label>
+    </div>
+    <div class="small">MOSFET low-side, LEDC PWM.</div>
+  </div>
+
+  <div class="card">
+    <h2>WS2812 Strip #1 (GPIO 17, 15 LEDs)</h2>
+    <div class="row">
+      <button onclick="fetch('/api/ws1/on')">On</button>
+      <button onclick="fetch('/api/ws1/off')">Off</button>
+      <label>Brightness <input id="ws1B" type="range" min="0" max="255" value="128" oninput="setWS1()"></label>
+    </div>
+    <div class="row">
+      <label>Color <input id="ws1C" type="color" value="#ffffff" oninput="setWS1()"></label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>WS2812 Strip #2 (GPIO 18, 15 LEDs)</h2>
+    <div class="row">
+      <button onclick="fetch('/api/ws2/on')">On</button>
+      <button onclick="fetch('/api/ws2/off')">Off</button>
+      <label>Brightness <input id="ws2B" type="range" min="0" max="255" value="128" oninput="setWS2()"></label>
+    </div>
+    <div class="row">
+      <label>Color <input id="ws2C" type="color" value="#ffffff" oninput="setWS2()"></label>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button onclick="fetch('/api/onall')">All On</button>
+      <button onclick="fetch('/api/offall')">All Off</button>
+    </div>
+  </div>
+
+<script>
+function hexToRgb(hex) {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  return m ? { r: parseInt(m[1],16), g: parseInt(m[2],16), b: parseInt(m[3],16) } : {r:255,g:255,b:255};
+}
+function setDim(){
+  const b = document.getElementById('dimB').value;
+  fetch('/api/dim/brightness?b=' + b);
+}
+function setWS1(){
+  const b = document.getElementById('ws1B').value;
+  const c = hexToRgb(document.getElementById('ws1C').value);
+  fetch(`/api/ws1/set?b=${b}&r=${c.r}&g=${c.g}&b2=${c.b}`);
+}
+function setWS2(){
+  const b = document.getElementById('ws2B').value;
+  const c = hexToRgb(document.getElementById('ws2C').value);
+  fetch(`/api/ws2/set?b=${b}&r=${c.r}&g=${c.g}&b2=${c.b}`);
+}
+</script>
+</body>
+</html>
+)HTML";
+}
+
+// ------------------- API HANDLERS -------------------
+void handleOkJson(AsyncWebServerRequest* request, const String& body)
+{
+  request->send(200, "application/json", body);
+}
+
+uint8_t getQueryU8(AsyncWebServerRequest* req, const char* name, uint8_t def)
+{
+  if (req->hasParam(name)) {
+    int v = req->getParam(name)->value().toInt();
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    return (uint8_t)v;
   }
+  return def;
 }
 
-// Scale a 24-bit color by an 0-255 scale (0 = off, 255 = full)
-uint32_t scaleColor(uint32_t color, uint8_t scale) {
-  uint8_t r = (color >> 16) & 0xFF;
-  uint8_t g = (color >> 8) & 0xFF;
-  uint8_t b = color & 0xFF;
-  uint8_t rs = (uint16_t(r) * scale) / 255;
-  uint8_t gs = (uint16_t(g) * scale) / 255;
-  uint8_t bs = (uint16_t(b) * scale) / 255;
-  return Adafruit_NeoPixel::Color(rs, gs, bs);
+void registerRoutes()
+{
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* req){
+    AsyncWebServerResponse* res = req->beginResponse(200, "text/html", htmlIndex());
+    res->addHeader("Cache-Control", "no-store");
+    req->send(res);
+  });
+
+  // -------- DIM STRIP (PWM) --------
+  server.on("/api/dim/on", HTTP_GET, [](AsyncWebServerRequest* req){
+    dimState.on = true;
+    applyDimPwm();
+    handleOkJson(req, "{\"ok\":true}");
+  });
+  server.on("/api/dim/off", HTTP_GET, [](AsyncWebServerRequest* req){
+    dimState.on = false;
+    applyDimPwm();
+    handleOkJson(req, "{\"ok\":true}");
+  });
+  server.on("/api/dim/brightness", HTTP_GET, [](AsyncWebServerRequest* req){
+    uint8_t b = getQueryU8(req, "b", dimState.brightness);
+    dimState.brightness = b;
+    applyDimPwm();
+    handleOkJson(req, String("{\"ok\":true,\"brightness\":") + b + "}");
+  });
+
+  // -------- WS1 --------
+  server.on("/api/ws1/on", HTTP_GET, [](AsyncWebServerRequest* req){
+    ws1State.on = true; markDirty(ws1Dirty);
+    handleOkJson(req, "{\"ok\":true}");
+  });
+  server.on("/api/ws1/off", HTTP_GET, [](AsyncWebServerRequest* req){
+    ws1State.on = false; markDirty(ws1Dirty);
+    handleOkJson(req, "{\"ok\":true}");
+  });
+  server.on("/api/ws1/set", HTTP_GET, [](AsyncWebServerRequest* req){
+    ws1State.brightness = getQueryU8(req, "b", ws1State.brightness);
+    ws1State.r = getQueryU8(req, "r", ws1State.r);
+    ws1State.g = getQueryU8(req, "g", ws1State.g);
+    ws1State.b = getQueryU8(req, "b2", ws1State.b);
+    markDirty(ws1Dirty);
+    handleOkJson(req, "{\"ok\":true}");
+  });
+
+  // -------- WS2 --------
+  server.on("/api/ws2/on", HTTP_GET, [](AsyncWebServerRequest* req){
+    ws2State.on = true; markDirty(ws2Dirty);
+    handleOkJson(req, "{\"ok\":true}");
+  });
+  server.on("/api/ws2/off", HTTP_GET, [](AsyncWebServerRequest* req){
+    ws2State.on = false; markDirty(ws2Dirty);
+    handleOkJson(req, "{\"ok\":true}");
+  });
+  server.on("/api/ws2/set", HTTP_GET, [](AsyncWebServerRequest* req){
+    ws2State.brightness = getQueryU8(req, "b", ws2State.brightness);
+    ws2State.r = getQueryU8(req, "r", ws2State.r);
+    ws2State.g = getQueryU8(req, "g", ws2State.g);
+    ws2State.b = getQueryU8(req, "b2", ws2State.b);
+    markDirty(ws2Dirty);
+    handleOkJson(req, "{\"ok\":true}");
+  });
+
+  // -------- ALL --------
+  server.on("/api/onall", HTTP_GET, [](AsyncWebServerRequest* req){
+    dimState.on = ws1State.on = ws2State.on = true;
+    applyDimPwm();
+    markDirty();
+    handleOkJson(req, "{\"ok\":true}");
+  });
+  server.on("/api/offall", HTTP_GET, [](AsyncWebServerRequest* req){
+    dimState.on = ws1State.on = ws2State.on = false;
+    applyDimPwm();
+    markDirty();
+    handleOkJson(req, "{\"ok\":true}");
+  });
 }
 
-// ------------------- SETUP -------------------
-void setup() {
-  // PWM setup for dimmable strip
-  ledcSetup(0, 5000, 8);
-  ledcAttachPin(DIM_STRIP_PIN, 0);
+// ------------------- WIFI / OTA -------------------
+void setupWifi()
+{
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname(HOSTNAME);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
-  // WS2812 setup
+  Serial.print("Connecting to WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(250);
+    Serial.print(".");
+    if (millis() - start > 20000) { // 20s timeout -> continue anyway
+      break;
+    }
+  }
+  Serial.println();
+  Serial.printf("WiFi status: %d, IP: %s\n", WiFi.status(), WiFi.localIP().toString().c_str());
+
+  if (!MDNS.begin(HOSTNAME)) {
+    Serial.println("Error starting mDNS");
+  } else {
+    MDNS.addService("http", "tcp", 80);
+    MDNS.addService("arduino", "tcp", 3232); // OTA
+  }
+
+  ArduinoOTA.setHostname(HOSTNAME);
+  // Optional password:
+  // ArduinoOTA.setPassword("CHANGE_ME");
+  ArduinoOTA
+    .onStart([](){ Serial.println("OTA Start"); })
+    .onEnd([](){ Serial.println("\nOTA End"); })
+    .onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
+    })
+    .onError([](ota_error_t error) {
+      Serial.printf("OTA Error[%u]\n", error);
+    });
+  ArduinoOTA.begin();
+}
+
+// ------------------- SETUP/LOOP -------------------
+void setup()
+{
+  Serial.begin(115200);
+  delay(200);
+
+  // PWM for dimmable strip
+  ledcSetup(DIM_CH, DIM_FREQ, DIM_RES);
+  ledcAttachPin(DIM_STRIP_PIN, DIM_CH);
+  applyDimPwm();
+
+  // Addressable strips
   strip1.begin();
-  strip1.show();
   strip2.begin();
+  strip1.clear(); strip2.clear();
+  strip1.setBrightness(ws1State.brightness);
+  strip2.setBrightness(ws2State.brightness);
+  // default to white
+  strip1.fill(strip1.Color(ws1State.r, ws1State.g, ws1State.b));
+  strip2.fill(strip2.Color(ws2State.r, ws2State.g, ws2State.b));
+  strip1.show();
   strip2.show();
 
-  // seed RNG for blink timing jitter
-  randomSeed(esp_random());
+  setupWifi();
+
+  registerRoutes();
+  server.begin();
+
+  Serial.printf("HTTP server started at http://%s.local/ or http://%s/\n",
+                HOSTNAME, WiFi.localIP().toString().c_str());
 }
 
-// ------------------- LOOP -------------------
-void loop() {
-  unsigned long now = millis();
+void loop()
+{
+  // OTA runs here, non-blocking
+  ArduinoOTA.handle();
 
-  // --- Update master breathing envelope ---
-  if (now - lastBreathUpdate >= breathInterval) {
-    lastBreathUpdate = now;
-
-    // Breath position in [0..1]
-    static unsigned long breathStart = millis();
-    unsigned long t = (now - breathStart) % breathPeriod;
-    // use a smooth sinusoidal envelope: 0..1
-    float phase = (float)t / (float)breathPeriod; // 0..1
-    float env = (sinf(phase * 2.0f * M_PI) + 1.0f) * 0.5f; // 0..1
-    uint8_t env8 = uint8_t(env * 255.0f);
-
-    // Apply to PWM dimmable strip (scale pwmBase by envelope)
-    int pwmVal = (uint16_t(pwmBase) * env8) / 255;
-    ledcWrite(0, pwmVal);
-
-    // Blink event scheduling
-    if (!blinkActive && (now - lastBlinkEvent >= (unsigned long)nextBlinkInterval)) {
-      blinkActive = true;
-      blinkStart = now;
-      lastBlinkEvent = now;
-      // pick next interval with jitter
-      nextBlinkInterval = blinkIntervalBase + (int)random(-blinkJitter, blinkJitter);
-      if (nextBlinkInterval < 500) nextBlinkInterval = 500;
-    }
-    if (blinkActive && (now - blinkStart >= (unsigned long)blinkDuration)) {
-      blinkActive = false;
-    }
-
-    // Update addressable strips colors. Keep them at full brightness normally.
-    // If blinkActive, flash to white for the duration.
-    if (blinkActive) {
-      uint32_t white = strip1.Color(255, 255, 255);
-      for (int i = 0; i < strip1.numPixels(); i++) strip1.setPixelColor(i, white);
-      strip1.show();
-      for (int i = 0; i < strip2.numPixels(); i++) strip2.setPixelColor(i, white);
-      strip2.show();
-    } else {
-      // Normal per-LED animated colors at full brightness
-      for (int i = 0; i < strip1.numPixels(); i++) {
-        byte hue = (i * 256 / strip1.numPixels() + hueOffset) & 255;
-        uint32_t c = Wheel(hue);
-        strip1.setPixelColor(i, c);
-      }
-      strip1.show();
-
-      for (int i = 0; i < strip2.numPixels(); i++) {
-        byte hue = (i * 256 / strip2.numPixels() + hueOffset + 64) & 255;
-        uint32_t c = Wheel(hue);
-        strip2.setPixelColor(i, c);
-      }
-      strip2.show();
-    }
+  // If a strip is marked dirty, push a refresh (solid color only)
+  if (ws1Dirty) {
+    ws1Dirty = false;
+    applyStripSolid(strip1, ws1State);
+  }
+  if (ws2Dirty) {
+    ws2Dirty = false;
+    applyStripSolid(strip2, ws2State);
   }
 
-  // --- Update hue animation separately (controls changing colors over time) ---
-  if (now - lastHueUpdate >= hueInterval) {
-    lastHueUpdate = now;
-    hueOffset++;
-    if (hueOffset >= 256) hueOffset = 0;
-  }
+  // You can add lightweight periodic tasks here (no delay(…); use vTaskDelay if needed)
+  // vTaskDelay(1); // optional yield
 }
