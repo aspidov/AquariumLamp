@@ -17,6 +17,11 @@ static unsigned long s_animStart = 0;
 static unsigned long s_animDur = 0;
 // Wave animation phase
 static float s_wavePhase = 0.0f;
+// Police animation state
+static unsigned long s_policeLastToggle = 0;
+static bool s_policeBlue = false;
+static uint16_t s_policeSegmentSize = 3; // number of pixels per color segment
+static uint8_t s_savedPwmDuty = 0;
 
 void initPwm(int pin, int channel, int freq, int res, uint8_t initialDuty)
 {
@@ -231,6 +236,72 @@ void loop(StripState& ws1State, StripState& ws2State)
       }
       return;
     }
+
+    if (s_currentAnim == LEDController::Animation::Police) {
+      // Police: faster double-blink per color.
+      // Cycle (800ms):
+      // 0..100ms   -> RED flash 1
+      // 100..170ms -> short off
+      // 170..270ms -> RED flash 2
+      // 270..350ms -> off (gap)
+      // 350..450ms -> BLUE flash 1
+      // 450..520ms -> short off
+      // 520..620ms -> BLUE flash 2
+      // 620..800ms -> longer blackout
+      unsigned long nowMs = millis();
+      unsigned long phase = (nowMs - s_animStart) % 800UL;
+      uint8_t r = 0, g = 0, b = 0;
+      bool show = false;
+      if (phase < 100) {
+        // RED flash 1
+        r = 220; show = true;
+      } else if (phase < 170) {
+        show = false;
+      } else if (phase < 270) {
+        // RED flash 2
+        r = 220; show = true;
+      } else if (phase < 350) {
+        show = false;
+      } else if (phase < 450) {
+        // BLUE flash 1
+        b = 220; show = true;
+      } else if (phase < 520) {
+        show = false;
+      } else if (phase < 620) {
+        // BLUE flash 2
+        b = 220; show = true;
+      } else {
+        // longer blackout for realism
+        show = false;
+      }
+
+      // Ensure dimmable white (PWM channel 0) is off while police runs
+      // s_savedPwmDuty should have been saved in startAnimation; enforce off here too
+      ledcWrite(0, 0);
+
+      // Apply the chosen color (or clear) across both strips
+      if (s_strip2) {
+        if (show) {
+          uint32_t col = s_strip2->Color(r, g, b);
+          for (uint16_t i = 0; i < s_strip2->numPixels(); ++i) s_strip2->setPixelColor(i, col);
+          s_strip2->setBrightness(255);
+          s_strip2->show();
+        } else {
+          s_strip2->clear(); s_strip2->show();
+        }
+      }
+      if (s_strip1) {
+        if (show) {
+          uint32_t col = s_strip1->Color(r, g, b);
+          for (uint16_t i = 0; i < s_strip1->numPixels(); ++i) s_strip1->setPixelColor(i, col);
+          s_strip1->setBrightness(255);
+          s_strip1->show();
+        } else {
+          s_strip1->clear(); s_strip1->show();
+        }
+      }
+      return;
+    }
   }
 
   // If not animating, handle dirty updates
@@ -280,10 +351,28 @@ void startAnimation(LEDController::Animation anim, unsigned long durationMs)
   // store PWM duty knowledge implicitly (channel 0)
   // ledcRead is available to read back if needed
   }
+
+  if (anim == LEDController::Animation::Police) {
+  // reset police timing state
+  s_policeLastToggle = 0;
+  s_policeBlue = false;
+  // save current PWM duty and force off while police runs
+  s_savedPwmDuty = getPwmDuty(0);
+  ledcWrite(0, 0);
+  // ensure strips are cleared/prepared
+  if (s_strip2) { s_strip2->clear(); s_strip2->show(); }
+  if (s_strip1) { s_strip1->clear(); s_strip1->show(); }
+  }
 }
 
 void stopAnimation()
 {
+  // If we are stopping Police, restore saved PWM duty
+  if (s_currentAnim == LEDController::Animation::Police) {
+    // restore PWM duty
+    ledcWrite(0, s_savedPwmDuty);
+    s_savedPwmDuty = 0;
+  }
   s_currentAnim = LEDController::Animation::None;
 }
 

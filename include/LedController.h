@@ -18,7 +18,7 @@ namespace LEDController {
   void loop(StripState& ws1State, StripState& ws2State);
   
   // Animations for addressable strips (affect both strips together)
-  enum class Animation { None = 0, Sunrise, Sunset, Waves };
+  enum class Animation { None = 0, Sunrise, Sunset, Waves, Police };
   // Start an animation; durationMs is used for sunrise/sunset (default 30000ms)
   void startAnimation(Animation anim, unsigned long durationMs = 30000);
   void stopAnimation();
