@@ -36,9 +36,10 @@ void init(StripState& dimState, StripState& ws1State, StripState& ws2State, Adaf
 
   // Default schedule requested by user:
   // 06:00 local run sunrise (20 min) then set waves
-  addDailyEntry(6, 0, true, LEDController::Animation::Sunrise, 20UL * 60UL * 1000UL, 1);
+  addDailyEntry(6, 0, true, LEDController::Animation::Sunrise, 60UL * 60UL * 1000UL, 1);
   // 20:30 UTC run sunset (20 min) then stop and turn off
-  addDailyEntry(20, 30, true, LEDController::Animation::Sunset, 20UL * 60UL * 1000UL, 3);
+  addDailyEntry(20, 10, true, LEDController::Animation::Sunset, 60UL * 60UL * 1000UL, 3);
+  addDailyEntry(10, 00, true, LEDController::Animation::Police, 30UL * 1000UL, 4);
 }
 
 void addDailyEntry(int hour, int minute, bool isUtc, LEDController::Animation anim, unsigned long durationMs, int followUpAction)
@@ -65,6 +66,10 @@ static void performFollowUp(int action)
       if (s_strip1) { s_strip1->clear(); s_strip1->show(); }
       if (s_strip2) { s_strip2->clear(); s_strip2->show(); }
       break;
+    case 4:
+      LEDController::stopAnimation();
+      LEDController::startAnimation(LEDController::Animation::Sunrise, 0);
+      LEDController::setPwmDuty(0, 255);
   }
 }
 
@@ -129,6 +134,7 @@ void loop()
         case LEDController::Animation::Sunrise: animName = "Sunrise"; break;
         case LEDController::Animation::Sunset: animName = "Sunset"; break;
         case LEDController::Animation::Waves: animName = "Waves"; break;
+        case LEDController::Animation::Police: animName = "Police"; break;
         default: break;
       }
       if (i) json += ",";
