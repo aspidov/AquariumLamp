@@ -77,6 +77,7 @@ static String htmlIndex()
   <button onclick="startAnim('sunset')">Sunset</button>
   <button onclick="startAnim('waves')">Waves</button>
   <button onclick="startAnim('police')">Police</button>
+  <button onclick="startAnim('christmas')">Christmas</button>
   <button onclick="startTest('sunrise')">Test Sunrise (1m)</button>
   <button onclick="startTest('sunset')">Test Sunset (1m)</button>
   <button onclick="fetch('/api/anim/stop')">Stop Anim</button>
@@ -263,6 +264,8 @@ void registerRoutes(StripState& dimState, StripState& ws1State, StripState& ws2S
       LEDController::startAnimation(LEDController::Animation::Waves, dur);
     } else if (name == "police") {
       LEDController::startAnimation(LEDController::Animation::Police, dur);
+    } else if (name == "christmas") {
+      LEDController::startAnimation(LEDController::Animation::Christmas, dur);
     }
     req->send(200, "application/json", "{\"ok\":true}");
   });
@@ -278,6 +281,7 @@ void registerRoutes(StripState& dimState, StripState& ws1State, StripState& ws2S
       case LEDController::Animation::Sunset: animName = "Sunset"; break;
   case LEDController::Animation::Waves: animName = "Waves"; break;
   case LEDController::Animation::Police: animName = "Police"; break;
+  case LEDController::Animation::Christmas: animName = "Christmas"; break;
       default: break;
     }
 

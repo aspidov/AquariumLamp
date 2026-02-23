@@ -23,6 +23,12 @@ namespace LEDController
   static bool s_policeBlue = false;
   static uint16_t s_policeSegmentSize = 3; // number of pixels per color segment
   static uint8_t s_savedPwmDuty = 0;
+  // smoothing: timestamp of last LED update (used for per-frame blending)
+  static unsigned long s_lastLedUpdate = 0;
+  // Christmas animation helpers
+  static unsigned long s_christmasAllOffUntil = 0;
+  static unsigned long s_christmasLastStep = 0;
+  static uint8_t s_christmasPhaseOffset = 0;
 
   void initPwm(int pin, int channel, int freq, int res, uint8_t initialDuty)
   {
@@ -209,6 +215,132 @@ namespace LEDController
           ledcWrite(0, 255);
           s_currentAnim = LEDController::Animation::None;
         }
+        return;
+      }
+      if (s_currentAnim == LEDController::Animation::Christmas)
+      {
+        // Christmas: groups of 5 LEDs flash in gold (no smooth transitions).
+        // Behavior: scan forward over combined LED array in groups of `groupSize`.
+        // Each step: group is ON (gold) for `onMs`, then ALL OFF for `offMs`,
+        // then advance to next group. This creates a festive strobbing band.
+        uint8_t pwm = getPwmDuty(0);
+        if (pwm > 0) { markDirty(1); markDirty(2); return; }
+
+        uint16_t n2 = s_strip2 ? s_strip2->numPixels() : 0;
+        uint16_t n1 = s_strip1 ? s_strip1->numPixels() : 0;
+        uint32_t total = (uint32_t)n2 + (uint32_t)n1;
+        if (total == 0) return;
+
+        // make the gold slightly more orange
+        // make the gold slightly more orange
+        // Orange color
+        // Make the color more golden-orange (no pure green phase)
+        // Golden-orange: keep red dominant, reduce green to avoid greenish hue,
+        // and a small blue component to warm toward a gold tint.
+        const uint8_t warmR = 255;
+        const uint8_t warmG = 110; // toned down to avoid green cast
+        const uint8_t warmB = 10;  // tiny blue to push toward gold
+
+        const uint16_t groupSize = 6; // LEDs per group (user requested)
+        // base on/off durations (will be modulated)
+        // Increased for a much slower animation per user request
+        const float baseOnMs = 1500.0f;
+        const float baseOffMs = 800.0f;
+        // shorter fade window (ms) at the start/end of ON phase (base)
+        const unsigned long baseFadeMs = 50UL;
+
+        // modulation: slow sine wave to make pattern speed ebb and flow
+        float tSec = (now - s_animStart) / 1000.0f;
+        // frequency (radians per second) - ~6.28 rad => period ~6.28s when freq=1.0
+        const float freq = 0.9f;
+        float osc = (sinf(tSec * freq) + 1.0f) * 0.5f; // 0..1
+        // multiplier range: 0.6 .. 1.2 (slower -> faster). Reduce peak speed.
+        float mult = 0.6f + 0.6f * osc;
+
+        unsigned long onMs = (unsigned long)(baseOnMs * mult + 0.5f);
+        unsigned long offMs = (unsigned long)(baseOffMs * mult + 0.5f);
+        unsigned long period = onMs + offMs;
+        unsigned long fadeMs = (unsigned long)min((float)baseFadeMs, (float)onMs * 0.45f);
+
+        uint32_t groupCount = (total + groupSize - 1) / groupSize;
+        unsigned long rel = (unsigned long)(now - s_animStart);
+        unsigned long step = (period > 0) ? (rel / period) : 0;
+        // offset of the pattern shifts every step so the alternating groups move
+        unsigned long offset = step % (unsigned long)groupCount;
+
+        unsigned long within = rel % period;
+        bool isOnPhase = (within < onMs);
+
+        // smoothing configuration (how quickly pixels blend toward their target)
+        const unsigned long smoothMs = 120UL; // blending time constant in ms
+        unsigned long dt = (s_lastLedUpdate == 0) ? 0 : (now - s_lastLedUpdate);
+        float blendA = 1.0f;
+        if (smoothMs > 0)
+        {
+          blendA = (float)dt / (float)smoothMs;
+          if (blendA < 0.02f) blendA = 0.02f; // always make measurable progress
+          if (blendA > 1.0f) blendA = 1.0f;
+        }
+
+        // Render combined strips with alternating groups: off, on, off, on, ...
+        for (uint32_t ci = 0; ci < total; ++ci)
+        {
+          Adafruit_NeoPixel *strip;
+          uint16_t pix;
+          mapCombinedToStrip((uint16_t)ci, strip, pix);
+          if (!strip) continue;
+
+          // compute which group this pixel belongs to
+          uint32_t gidx = ci / (uint32_t)groupSize;
+          // determine if this group is scheduled to be ON for this step
+          bool groupShouldBeOn = (((gidx + offset) % 2UL) == 0UL);
+
+          // If this group should be off, make it fully off (no residual blending).
+          if (!(isOnPhase && groupShouldBeOn))
+          {
+            strip->setPixelColor(pix, 0);
+            continue;
+          }
+
+          // compute eased alpha for the ON group (use cosine ease for smoothness)
+          float alpha = 1.0f;
+          if (within < fadeMs)
+          {
+            float t = (float)within / (float)fadeMs; // 0..1
+            alpha = 0.5f - 0.5f * cosf(t * 3.14159265f);
+          }
+          else if (within > (onMs - fadeMs))
+          {
+            unsigned long rem = onMs - within;
+            float t = (float)rem / (float)fadeMs; // 0..1
+            alpha = 0.5f - 0.5f * cosf(t * 3.14159265f);
+          }
+          // apply slight perceptual curve so mid-brightness looks smooth
+          alpha = powf(alpha, 1.8f);
+
+          // compute target color based on eased alpha
+          uint8_t tr = (uint8_t)((float)warmR * alpha + 0.5f);
+          uint8_t tg = (uint8_t)((float)warmG * alpha + 0.5f);
+          uint8_t tb = (uint8_t)((float)warmB * alpha + 0.5f);
+
+          // read previous pixel and blend toward target to avoid hard steps
+          uint32_t prevCol = strip->getPixelColor(pix);
+          uint8_t pr = (uint8_t)((prevCol >> 16) & 0xFF);
+          uint8_t pg = (uint8_t)((prevCol >> 8) & 0xFF);
+          uint8_t pb = (uint8_t)(prevCol & 0xFF);
+
+          uint8_t br = (uint8_t)((float)pr + (float)(tr - pr) * blendA + 0.5f);
+          uint8_t bg = (uint8_t)((float)pg + (float)(tg - pg) * blendA + 0.5f);
+          uint8_t bb = (uint8_t)((float)pb + (float)(tb - pb) * blendA + 0.5f);
+
+          strip->setPixelColor(pix, strip->Color(br, bg, bb));
+        }
+
+        if (s_strip2) { s_strip2->setBrightness(255); s_strip2->show(); }
+        if (s_strip1) { s_strip1->setBrightness(255); s_strip1->show(); }
+
+        s_lastLedUpdate = now;
+
         return;
       }
 
@@ -474,6 +606,11 @@ namespace LEDController
     s_animStart = millis();
     s_animDur = durationMs;
     s_wavePhase = 0.0f;
+    if (anim == LEDController::Animation::Christmas) {
+      s_christmasAllOffUntil = 0;
+      s_christmasLastStep = 0;
+      s_christmasPhaseOffset = (uint8_t)(s_animStart % 5);
+    }
     // If sunrise/sunset, ensure regular PWM strip is off initially and set a single dim pixel
     if (anim == LEDController::Animation::Sunrise)
     {
